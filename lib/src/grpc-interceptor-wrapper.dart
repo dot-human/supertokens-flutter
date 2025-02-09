@@ -1,3 +1,6 @@
+import 'dart:async';
+import 'package:async/async.dart';
+
 import 'package:grpc/grpc.dart';
 import 'package:mutex/mutex.dart';
 import 'package:supertokens_flutter/src/anti-csrf.dart';
@@ -5,6 +8,36 @@ import 'package:supertokens_flutter/src/constants.dart';
 import 'package:supertokens_flutter/src/utilities.dart';
 import 'package:supertokens_flutter/src/front-token.dart';
 import 'package:supertokens_flutter/supertokens.dart';
+
+class ResponseFutureImpl<R> extends DelegatingFuture<R>
+    implements ResponseFuture<R> {
+
+  ResponseFutureImpl() : this._(Completer<R>());
+
+  ResponseFutureImpl._(this._result) : super(_result.future);
+  Response? pendingCall;
+
+  final Completer<R> _result;
+  final _headers = Completer<Map<String, String>>();
+  final _trailers = Completer<Map<String, String>>();
+
+  void complete(ResponseFuture<R> other) {
+    _result.complete(other);
+    _headers.complete(other.headers);
+    _trailers.complete(other.trailers);
+  }
+
+  @override
+  Future<void> cancel() async {
+    await pendingCall?.cancel();
+  }
+
+  @override
+  Future<Map<String, String>> get headers => _headers.future;
+
+  @override
+  Future<Map<String, String>> get trailers => _trailers.future;
+}
 
 class SuperTokensGrpcInterceptor extends ClientInterceptor {
   final _refreshAPILock = ReadWriteMutex();
