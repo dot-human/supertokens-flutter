@@ -11,7 +11,6 @@ import 'package:supertokens_flutter/supertokens.dart';
 
 class ResponseFutureImpl<R> extends DelegatingFuture<R>
     implements ResponseFuture<R> {
-
   ResponseFutureImpl() : this._(Completer<R>());
 
   ResponseFutureImpl._(this._result) : super(_result.future);
@@ -41,54 +40,78 @@ class ResponseFutureImpl<R> extends DelegatingFuture<R>
 
 class SuperTokensGrpcInterceptor extends ClientInterceptor {
   final _refreshAPILock = ReadWriteMutex();
-  
+
   @override
   ResponseFuture<R> interceptUnary<Q, R>(
     ClientMethod<Q, R> method,
     Q request,
     CallOptions options,
     ClientUnaryInvoker<Q, R> invoker,
-  ) async {
+  ) {
+    final result = ResponseFutureImpl<R>();
+
     if (!SuperTokens.isInitCalled) {
-      throw GrpcError.unauthenticated('SuperTokens.init must be called before using gRPC client');
+      throw GrpcError.unauthenticated(
+          'SuperTokens.init must be called before using gRPC client');
     }
 
     // Skip if not matching API domain or refresh token URL
     if (!shouldIntercept(method.path)) {
-      return invoker(method, request, options);
+      final response = invoker(method, request, options);
+      result.complete(response);
+      return result;
     }
 
-    var enhancedOptions = await _addAuthHeaders(options);
-    var preRequestLocalSessionState = await SuperTokensUtils.getLocalSessionState();
+    () async {
+      try {
+        var enhancedOptions = await _addAuthHeaders(options);
+        var preRequestLocalSessionState =
+            await SuperTokensUtils.getLocalSessionState();
 
-    try {
-      return await _makeCall(
-        method,
-        request,
-        enhancedOptions,
-        invoker,
-        preRequestLocalSessionState,
-      );
-    } on GrpcError catch (e) {
-      if (e.code == StatusCode.unauthenticated) {
-        return await _handleUnauthorized(
+        final response = await _makeCall(
           method,
           request,
-          options,
+          enhancedOptions,
           invoker,
           preRequestLocalSessionState,
         );
+
+        result.complete(response);
+      } on GrpcError catch (e) {
+        if (e.code == StatusCode.unauthenticated) {
+          try {
+            var preRequestLocalSessionState =
+                await SuperTokensUtils.getLocalSessionState();
+            final response = await _handleUnauthorized(
+              method,
+              request,
+              options,
+              invoker,
+              preRequestLocalSessionState,
+            );
+            result.complete(response);
+          } catch (e) {
+            result._result.completeError(e);
+          }
+        } else {
+          result._result.completeError(e);
+        }
+      } catch (e) {
+        result._result.completeError(e);
       }
-      rethrow;
-    }
+    }();
+
+    return result;
   }
 
   Future<CallOptions> _addAuthHeaders(CallOptions options) async {
     Map<String, String> metadata = Map.from(options.metadata);
 
     // Add anti-CSRF token if exists
-    LocalSessionState localSessionState = await SuperTokensUtils.getLocalSessionState();
-    String? antiCSRFToken = await AntiCSRF.getToken(localSessionState.lastAccessTokenUpdate);
+    LocalSessionState localSessionState =
+        await SuperTokensUtils.getLocalSessionState();
+    String? antiCSRFToken =
+        await AntiCSRF.getToken(localSessionState.lastAccessTokenUpdate);
     if (antiCSRFToken != null) {
       metadata[antiCSRFHeaderKey] = antiCSRFToken;
     }
@@ -101,7 +124,8 @@ class SuperTokensGrpcInterceptor extends ClientInterceptor {
     }
 
     // Add token transfer method
-    metadata['st-auth-mode'] = SuperTokens.config.tokenTransferMethod.getValue();
+    metadata['st-auth-mode'] =
+        SuperTokens.config.tokenTransferMethod.getValue();
 
     return options.mergedWith(CallOptions(metadata: metadata));
   }
@@ -116,10 +140,10 @@ class SuperTokensGrpcInterceptor extends ClientInterceptor {
     await _refreshAPILock.acquireRead();
     try {
       final response = await invoker(method, request, options);
-      
+
       // Update tokens from metadata if present
       await _updateTokensFromMetadata(response, preRequestLocalSessionState);
-      
+
       return response;
     } finally {
       _refreshAPILock.release();
@@ -131,7 +155,7 @@ class SuperTokensGrpcInterceptor extends ClientInterceptor {
     LocalSessionState preRequestLocalSessionState,
   ) async {
     final metadata = response.trailers;
-    
+
     // Update front token if present
     String? frontToken = metadata?[frontTokenHeaderKey];
     if (frontToken != null) {
@@ -168,7 +192,7 @@ class SuperTokensGrpcInterceptor extends ClientInterceptor {
   ) async {
     await _refreshAPILock.acquireWrite();
     try {
-      final UnauthorisedResponse shouldRetry = 
+      final UnauthorisedResponse shouldRetry =
           await Client.onUnauthorisedResponse(preRequestLocalSessionState);
 
       if (shouldRetry.status == UnauthorisedStatus.RETRY) {
@@ -185,7 +209,7 @@ class SuperTokensGrpcInterceptor extends ClientInterceptor {
       if (shouldRetry.exception != null) {
         throw GrpcError.unauthenticated(shouldRetry.exception!.message);
       }
-      
+
       throw GrpcError.unauthenticated('Session expired');
     } finally {
       _refreshAPILock.release();
@@ -201,10 +225,8 @@ class SuperTokensGrpcInterceptor extends ClientInterceptor {
       return false;
     }
 
-    if (!Utils.shouldDoInterceptions(
-      path,
-      SuperTokens.config.apiDomain,
-      SuperTokens.config.sessionTokenBackendDomain)) {
+    if (!Utils.shouldDoInterceptions(path, SuperTokens.config.apiDomain,
+        SuperTokens.config.sessionTokenBackendDomain)) {
       return false;
     }
 
