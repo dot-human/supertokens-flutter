@@ -55,7 +55,6 @@ class SuperTokensGrpcInterceptor extends ClientInterceptor {
           'SuperTokens.init must be called before using gRPC client');
     }
 
-    // Skip if not matching API domain or refresh token URL
     if (!shouldIntercept(method.path)) {
       final response = invoker(method, request, options);
       result.complete(response);
@@ -106,8 +105,6 @@ class SuperTokensGrpcInterceptor extends ClientInterceptor {
 
   Future<CallOptions> _addAuthHeaders(CallOptions options) async {
     Map<String, String> metadata = Map.from(options.metadata);
-
-    // Add anti-CSRF token if exists
     LocalSessionState localSessionState =
         await SuperTokensUtils.getLocalSessionState();
     String? antiCSRFToken =
@@ -116,14 +113,12 @@ class SuperTokensGrpcInterceptor extends ClientInterceptor {
       metadata[antiCSRFHeaderKey] = antiCSRFToken;
     }
 
-    // Add authorization if required
     String? accessToken = await Utils.getTokenForHeaderAuth(TokenType.ACCESS);
     String? refreshToken = await Utils.getTokenForHeaderAuth(TokenType.REFRESH);
     if (accessToken != null && refreshToken != null) {
       metadata['authorization'] = 'Bearer $accessToken';
     }
 
-    // Add token transfer method
     metadata['st-auth-mode'] =
         SuperTokens.config.tokenTransferMethod.getValue();
 
@@ -137,13 +132,11 @@ class SuperTokensGrpcInterceptor extends ClientInterceptor {
     ClientUnaryInvoker<Q, R> invoker,
     LocalSessionState preRequestLocalSessionState,
   ) async {
+    // is this lock needed? check http implementation.
     await _refreshAPILock.acquireRead();
     try {
-      final response = await invoker(method, request, options);
-
-      // Update tokens from metadata if present
+      final response = invoker(method, request, options);
       await _updateTokensFromMetadata(response, preRequestLocalSessionState);
-
       return response;
     } finally {
       _refreshAPILock.release();
@@ -154,16 +147,16 @@ class SuperTokensGrpcInterceptor extends ClientInterceptor {
     ResponseFuture response,
     LocalSessionState preRequestLocalSessionState,
   ) async {
-    final metadata = response.trailers;
+    final metadata = await response.trailers;
 
-    // Update front token if present
-    String? frontToken = metadata?[frontTokenHeaderKey];
+    // purpose of front-token: https://community.supertokens.com/t/12094847/hey-everyone-is-there-a-page-in-documentation-explaining-how
+    // base64 encoding of access token's payload used for cookie-based auth
+    String? frontToken = metadata[frontTokenHeaderKey];
     if (frontToken != null) {
       await FrontToken.setItem(frontToken);
     }
 
-    // Update anti-CSRF token if present
-    String? antiCSRFToken = metadata?[antiCSRFHeaderKey];
+    String? antiCSRFToken = metadata[antiCSRFHeaderKey];
     if (antiCSRFToken != null) {
       await AntiCSRF.setToken(
         antiCSRFToken,
@@ -171,13 +164,12 @@ class SuperTokensGrpcInterceptor extends ClientInterceptor {
       );
     }
 
-    // Update access and refresh tokens if present
-    String? accessToken = metadata?[ACCESS_TOKEN_NAME];
+    String? accessToken = metadata[ACCESS_TOKEN_NAME];
     if (accessToken != null) {
       await Utils.setToken(TokenType.ACCESS, accessToken);
     }
 
-    String? refreshToken = metadata?[REFRESH_TOKEN_NAME];
+    String? refreshToken = metadata[REFRESH_TOKEN_NAME];
     if (refreshToken != null) {
       await Utils.setToken(TokenType.REFRESH, refreshToken);
     }
