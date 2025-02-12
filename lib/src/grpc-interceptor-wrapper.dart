@@ -185,7 +185,7 @@ class SuperTokensGrpcInterceptor extends ClientInterceptor {
     await _refreshAPILock.acquireWrite();
     try {
       final UnauthorisedResponse shouldRetry =
-          await Client.onUnauthorisedResponse(preRequestLocalSessionState);
+          await onUnauthorisedResponse(preRequestLocalSessionState);
 
       if (shouldRetry.status == UnauthorisedStatus.RETRY) {
         final newOptions = await _addAuthHeaders(options);
@@ -224,4 +224,139 @@ class SuperTokensGrpcInterceptor extends ClientInterceptor {
 
     return true;
   }
+
+  Future<UnauthorisedResponse> onUnauthorisedResponse(
+    LocalSessionState preRequestLocalSessionState,
+    ClientChannel channel,
+  ) async {
+    try {
+      await _refreshAPILock.acquireWrite();
+
+      LocalSessionState postLockLocalSessionState =
+          await SuperTokensUtils.getLocalSessionState();
+
+      if (postLockLocalSessionState.status ==
+          LocalSessionStateStatus.NOT_EXISTS) {
+        SuperTokens.config.eventHandler(Eventype.UNAUTHORISED);
+        return UnauthorisedResponse(status: UnauthorisedStatus.SESSION_EXPIRED);
+      }
+
+      // Check if session state changed while waiting for lock
+      if (postLockLocalSessionState.status !=
+              preRequestLocalSessionState.status ||
+          (postLockLocalSessionState.status == LocalSessionStateStatus.EXISTS &&
+              preRequestLocalSessionState.status ==
+                  LocalSessionStateStatus.EXISTS &&
+              postLockLocalSessionState.lastAccessTokenUpdate !=
+                  preRequestLocalSessionState.lastAccessTokenUpdate)) {
+        return UnauthorisedResponse(status: UnauthorisedStatus.RETRY);
+      }
+
+      // Create metadata for refresh call
+      var metadata = <String, String>{};
+
+      if (preRequestLocalSessionState.status ==
+          LocalSessionStateStatus.EXISTS) {
+        String? antiCSRFToken = await AntiCSRF.getToken(
+            preRequestLocalSessionState.lastAccessTokenUpdate);
+        if (antiCSRFToken != null) {
+          metadata[antiCSRFHeaderKey] = antiCSRFToken;
+        }
+      }
+
+      // Add required headers
+      metadata['rid'] = SuperTokens.rid;
+      metadata['fdi-version'] = Version.supported_fdi.join(',');
+
+      String? refreshToken =
+          await Utils.getTokenForHeaderAuth(TokenType.REFRESH);
+      if (refreshToken != null) {
+        metadata['authorization'] = 'Bearer $refreshToken';
+      }
+
+      SuperTokensTokenTransferMethod tokenTransferMethod =
+          SuperTokens.config.tokenTransferMethod;
+      metadata['st-auth-mode'] = tokenTransferMethod.getValue();
+
+      // Create call options with metadata
+      final options = CallOptions(metadata: metadata);
+
+      // Make refresh token call using gRPC
+      // Note: You'll need to define this method according to your proto definition
+      final stub = RefreshServiceClient(channel);
+
+      try {
+        final response = await stub.refresh(
+          RefreshRequest(), // Or whatever request object your proto defines
+          options: options,
+        );
+
+        // Update tokens from response metadata
+        final responseMetadata = await response.trailers;
+
+        String? frontTokenInMetadata = responseMetadata[frontTokenHeaderKey];
+        if (responseMetadata
+                .containsKey(StatusCode.unauthenticated.toString()) &&
+            frontTokenInMetadata == null) {
+          await FrontToken.setItem("remove");
+        }
+
+        // Save tokens from metadata
+        await _updateTokensFromMetadata(response, preRequestLocalSessionState);
+
+        SuperTokensUtils.fireSessionUpdateEventsIfNecessary(
+          wasLoggedIn: preRequestLocalSessionState.status ==
+              LocalSessionStateStatus.EXISTS,
+          status: StatusCode.ok.value,
+          frontTokenFromResponse: frontTokenInMetadata,
+        );
+
+        if ((await SuperTokensUtils.getLocalSessionState()).status ==
+            LocalSessionStateStatus.NOT_EXISTS) {
+          return UnauthorisedResponse(
+              status: UnauthorisedStatus.SESSION_EXPIRED);
+        }
+
+        SuperTokens.config.eventHandler(Eventype.REFRESH_SESSION);
+        return UnauthorisedResponse(status: UnauthorisedStatus.RETRY);
+      } on GrpcError catch (e) {
+        if (e.code == StatusCode.unauthenticated) {
+          return UnauthorisedResponse(
+            status: UnauthorisedStatus.API_ERROR,
+            error: GrpcError.unauthenticated(
+                "Refresh API returned unauthenticated status"),
+          );
+        }
+        return UnauthorisedResponse(
+          status: UnauthorisedStatus.API_ERROR,
+          error: GrpcError.unknown("Refresh API failed: ${e.message}"),
+        );
+      }
+    } catch (e) {
+      return UnauthorisedResponse(
+        status: UnauthorisedStatus.API_ERROR,
+        error: GrpcError.unknown("Failed to refresh session: $e"),
+      );
+    } finally {
+      _refreshAPILock.release();
+    }
+  }
+}
+
+enum UnauthorisedStatus {
+  SESSION_EXPIRED,
+  API_ERROR,
+  RETRY,
+}
+
+class UnauthorisedResponse {
+  final UnauthorisedStatus status;
+  final Exception? error;
+  final GrpcError? exception; // Changed from http.ClientException to GrpcError
+
+  UnauthorisedResponse({
+    required this.status,
+    this.error,
+    this.exception,
+  });
 }
